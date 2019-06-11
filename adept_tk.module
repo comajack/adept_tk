@@ -1,0 +1,1518 @@
+<?php 
+/**
+ * @file
+ * OG Delivery module main file.
+ */
+
+/**
+ * Implements hook_permission().
+ */
+function adept_tk_permission() {
+  return array(
+    'access adept_tk settings' => array(
+      'title' => t('Access Adept'),
+      'description' => t('Access to Adept variables.'),
+    ),
+  );
+}
+
+/**
+ * Implementation of hook_menu().
+ */
+function adept_tk_menu() {
+    $items = array();
+    $items['adept/gimme_citys'] = array(
+        'title' => 'Получить список городов',
+        'page callback' => 'adept_tk_getCityName',
+        'access callback' => 'user_access',
+        'access arguments' => array('access content'),
+    );
+    $items['adept/gimme_calc'] = array(
+        'title' => 'Получить стоимость доставки',
+        'page callback' => 'adept_tk_getCalc_ajax',
+        'access callback' => 'user_access',
+        'access arguments' => array('access content'),
+    );
+    $items['adept/pvz_find'] = array(
+        'title' => 'Поиск пункта выдачи',
+        'page callback' => 'adept_tk_pvz_find',
+        'access callback' => 'user_access',
+        'access arguments' => array('access content'),
+    );
+    $items['adept/checked'] = array(
+        'title' => 'Выбор доставки',
+        'page callback' => 'adept_tk_insert',
+        'access callback' => 'user_access',
+        'access arguments' => array('access content'),
+    );
+    // Config page
+    $items['admin/config/system/adept_tk'] = array(
+        'title' => t('Adept TK Core'),
+        'description' => t('Adept TK base settings page.'),
+        'page callback' => 'drupal_get_form',
+        'page arguments' => array('adept_tk_admin_settings'),
+        'access arguments' => array('access adept_tk settings'),
+        'type' => MENU_NORMAL_ITEM,
+        'file' => 'adept_tk.admin.inc',
+    );
+    return $items;
+}
+
+/**
+ * Поиск пунктов выдачи СДЭК
+ */
+function adept_tk_pvz_find()
+{
+    if ($_POST['code']) {
+        $xml = simplexml_load_file('http://integration.cdek.ru/pvzlist/v1/xml?cityid='.$_POST['code']);
+        $string = '';
+        foreach ($xml as $key) {
+            $string .= "<label><input type='radio' class='pvz-point' name='pvz' id='". $key['Code'] ."' value='". $key['Name'] ."'>".$key['Name'].", адрес: ".$key['Address']."</input></label>";
+        }
+        echo $string;
+    }
+}
+
+/**
+ * Shipping rate update
+ */
+function adept_tk_upd_shipping_rate($orderId, $rate, $label)
+{
+    $result = db_query("SELECT line_item_id FROM {uc_order_line_items} WHERE order_id = :id AND type = :type", array(':id' => $orderId, ':type' => 'shipping'));
+    if ($lid = $result->fetchField()) {
+        uc_order_update_line_item($lid,
+            $label,
+            $rate
+        );
+    }
+    else {
+        uc_order_line_item_add($orderId, 'shipping',
+            $label,
+            $rate
+        );
+    }
+}
+
+/**
+ * Add information to order comments
+ */
+function adept_tk_add_comments($orderId, $city, $cost, $information, $tk)
+{
+    $row = db_select('uc_order_comments', 'uoc')
+        ->fields('uoc')
+        ->condition('uoc.order_id', $orderId)
+        ->condition('uoc.message', db_like( 'Annotation' ) . '%', 'LIKE')
+        ->execute()
+        ->fetchAll();
+    $num_of_results = count($row);
+    if ($num_of_results > 0) {
+        $message = db_update('uc_order_comments', 'uoc')
+            ->fields(array(
+                'uoc.message' => "Annotation: доставка заказа осуществляется транспортной компанией " . $tk . " в город " . $city . " стоимость доставки " . $cost . ". " . $information,
+            ))
+            ->condition('uoc.order_id', $orderId)
+            ->condition('uoc.message', db_like( 'Annotation' ) . '%', 'LIKE')
+            ->execute();
+    }else{
+        uc_order_comment_save($orderId, 0, t('Annotation: доставка заказа осуществляется транспортной компанией @transportcompany в город @city стоимость доставки @amount. @information', array('@transportcompany' => $tk, '@city' => $city, '@amount' => $cost, '@information' => $information)), 'order');
+    }
+}
+
+
+/**
+ * hook_uc_order
+ */
+function adept_tk_uc_order($op, $order, $arg2)
+{
+    if ($op == 'presave' && isset($order->billing_ucxf_shipping) && $order->billing_ucxf_shipping == variable_get('adept_tk_num', '1')) {
+        $calcInfo = adept_tk_load($order->order_id);
+        $data = $calcInfo->getData();
+        if (is_array($data) && isset($data['current'])) {
+            $order->quote['rate'] = $data['current']['cost'];
+            // Current TC name
+            switch ($data['current']['tk']) {
+                case variable_get('adept_tk_dellin_num'):
+                    $tk = "Деловые линии";
+                    $information = '';
+                    break;
+
+                case variable_get('adept_tk_pec_num'):
+                    $tk = "ПЭК";
+                    $information = '';
+                    break;
+
+                case variable_get('adept_tk_gtd_num'):
+                    $tk = "КИТ (Кашалот)";
+                    $information = '';
+                    break;
+
+                case variable_get('adept_tk_nrg_num'):
+                    $tk = "Энергия";
+                    $information = '';
+                    break;
+
+                case variable_get('adept_tk_cdek_num'):
+                    $tk = "СДЭК";
+                    $information = "Код пункта выдачи: " . $data['cdek-pvz-code'] . " Наименование пункта выдачи: " . $data['cdek-pvz-name'];
+                    break;
+            }
+            // Shipping rate update
+            adept_tk_upd_shipping_rate($order->order_id, $order->quote['rate'], 'Транспортная компания');
+            // Add information to order comments
+            adept_tk_add_comments($order->order_id, $data['current']['city'], $order->quote['rate'], $information, $tk);
+        }
+    }
+}
+
+/**
+ * Save order data
+ */
+function adept_tk_insert()
+{
+    if (isset($_POST['order'])) {
+        $calcInfo = adept_tk_load($_POST['order']);
+    }else{
+        watchdog('adept_tk', 'Ошибка в передаче номера заказа при внесении стоимости доставки');
+        header('HTTP/1.1 500 Internal Server Booboo');
+        die;
+    }
+    if (isset($_POST['cost'])) {
+        $data = array('current' => array('cost' => $_POST['cost'], 'tk' => $_POST['tk'], 'city' => $_POST['code']), 'cdek-pvz-code' => '', 'cdek-pvz-name' => '');
+        $calcInfo->setData($data);
+    }
+    if (isset($_POST['pvzcode'])) {
+        $current = array('cdek-pvz-code' => $_POST['pvzcode'], 'cdek-pvz-name' => $_POST['pvzname']);
+        $calcInfo->setData($current);
+    }
+    adept_tk_save($calcInfo);
+}
+
+/**
+ * Noscript calc
+ */
+// UNDER CONSTRUCTION
+// function adept_tk_calc($tk, $city, $calcInfo)
+// {
+//     switch ($tk) {
+//         case '1':
+//             $dellin = new adept_tk_CalculatePriceDeliveryDellin();
+//             $dellin->getCityCode($city);
+//             $dellin->setVolume($calcInfo->orderVolume);
+//             $dellin->setWeight($calcInfo->orderWeight);
+//             $dellinAnswer = array( 'dellin' => is_bool($dellin->calculate()) ? false : $dellin->calculate() );
+//             $calcInfo->setData($dellinAnswer);
+//             break;
+
+//         case '3':
+//             $pec = new adept_tk_CalculatePriceDeliveryPec();
+//             $pec->getCityCode($city);
+//             $pec->setVolume($calcInfo->orderVolume);
+//             $pec->setWeight($calcInfo->orderWeight);
+//             $pecAnswer = array( 'pec' => is_bool($pec->calculate()) ? false : $pec->calculate() );
+//             $calcInfo->setData($pecAnswer);
+//             break;
+
+//         case '4':
+//             $gtd = new adept_tk_CalculatePriceDeliveryGtd();
+//             $gtd->getCityCode($city);
+//             $gtd->setVolume($calcInfo->orderVolume);
+//             $gtd->setPrice((int)$calcInfo->orderAmount);
+//             $gtd->setWeight($calcInfo->orderWeight);
+//             $gtdAnswer = array( 'gtd' => is_bool($gtd->calculate()) ? false : $gtd->calculate() );
+//             $calcInfo->setData($gtdAnswer);
+//             break;
+
+//         case '7':
+//             $nrg = new adept_tk_CalculatePriceDeliveryNrg();
+//             $nrg->getCityCode($city);
+//             $nrg->setPrice($calcInfo->orderAmount);
+//             $nrg->setWeight($calcInfo->orderWeight);
+//             $nrgAnswer = array( 'nrg' => is_bool($nrg->calculate()) ? false : $nrg->calculate() );
+//             $calcInfo->setData($nrgAnswer);
+//             break;
+
+//         case '14':
+//             # code...
+//             break;
+//     }
+//     adept_tk_save($calcInfo);
+// }
+
+/**
+ * AJAX calculator
+ * @param int $_POST['order']
+ * @param int $_POST['city']
+ */
+function adept_tk_getCalc_ajax()
+{
+    if ($_POST['order']) {
+        $calcInfo = adept_tk_load($_POST['order']);
+    }else{
+        watchdog('adept_tk', 'Ошибка в передаче номера заказа при расчёте стоимости доставки');
+        header('HTTP/1.1 500 Internal Server Booboo');
+    }
+    if ($_POST['city']) {
+        $gtd = new adept_tk_CalculatePriceDeliveryGtd();
+        $gtd->getCityCode($_POST['city']);
+        $gtd->setVolume($calcInfo->orderVolume);
+        $gtd->setPrice((int)$calcInfo->orderAmount);
+        $gtd->setWeight($calcInfo->orderWeight);
+        $gtdAnswer = array( 'gtd' => is_bool($gtd->calculate()) ? false : $gtd->calculate() );
+        $calcInfo->setData($gtdAnswer);
+        $dellin = new adept_tk_CalculatePriceDeliveryDellin();
+        $dellin->getCityCode($_POST['city']);
+        $dellin->setVolume($calcInfo->orderVolume);
+        $dellin->setWeight($calcInfo->orderWeight);
+        $dellinAnswer = array( 'dellin' => is_bool($dellin->calculate()) ? false : $dellin->calculate() );
+        $calcInfo->setData($dellinAnswer);
+        $nrg = new adept_tk_CalculatePriceDeliveryNrg();
+        $nrg->getCityCode($_POST['city']);
+        $nrg->setPrice($calcInfo->orderAmount);
+        $nrg->setWeight($calcInfo->orderWeight);
+        $nrgAnswer = array( 'nrg' => is_bool($nrg->calculate()) ? false : $nrg->calculate() );
+        $calcInfo->setData($nrgAnswer);
+        $pec = new adept_tk_CalculatePriceDeliveryPec();
+        $pec->getCityCode($_POST['city']);
+        $pec->setVolume($calcInfo->orderVolume);
+        $pec->setWeight($calcInfo->orderWeight);
+        $pecAnswer = array( 'pec' => is_bool($pec->calculate()) ? false : $pec->calculate() );
+        $calcInfo->setData($pecAnswer);
+    }else{
+        watchdog('adept_tk', 'Отсутствует город доставки при расчёте стоимости доставки. Заказ №'.$_POST['order']);
+        header('HTTP/1.1 500 Internal Server Booboo');
+    }
+    if ($_POST['code']) {
+        $cdek = new adept_tk_CalculatePriceDeliveryCdek();
+        $cdek_receiveCity = $_POST['code'];
+        $cdek_weightGood = $calcInfo->orderWeight;
+        $cdek_volumeGood = '0.01';
+        $cdek->setReceiverCityId($cdek_receiveCity);
+        $cdek->addGoodsItemByVolume($cdek_weightGood, $cdek_volumeGood);
+        if ($cdek->calculate() === true) {
+            $cdekAnswer = $cdek->getResult();
+            $answ = array( 'cdek' => array( 'price' => ceil($cdekAnswer['result']['price']/50)*50, 'city' => $_POST['city'], 'code' => $cdek_receiveCity ));
+            $calcInfo->setData($answ);
+        }else{
+            $answ = array( 'cdek' => false );
+            $calcInfo->setData($answ);
+        }
+    }
+    adept_tk_save($calcInfo);
+    if (adept_tk_info_view($calcInfo->data)) {
+        echo adept_tk_info_view($calcInfo->data);
+    }else{
+        header('HTTP/1.1 500 Internal Server Booboo');
+    }
+}
+
+function adept_tk_info_view($data)
+{
+    $string = '';
+    foreach ($data as $tk => $calc_val) {
+        switch ($tk) {
+            case 'gtd':
+                if (!!$calc_val) {
+                    foreach ($calc_val as $gtd_val) {
+                        $string .= "<label><input type='radio' class='radio_tk' name='radio_tk' id='4' data-code='" . $gtd_val['city'] . "' value=" . $gtd_val['price'] . ">ТК Кит (Кашалот) в ".$gtd_val['city'].", стоимость доставки ".$gtd_val['price']." рублей</input></label>";
+                    }
+                }
+                break;
+                
+            case 'dellin':
+                if (!!$calc_val) {
+                    foreach ($calc_val as $dellin_val) {
+                        $string .= "<label><input type='radio' class='radio_tk' name='radio_tk' id='1' data-code='" . $dellin_val['city'] . "' value=" . $dellin_val['price'] . ">ТК Деловые Линии в ".$dellin_val['city'].", стоимость доставки ".$dellin_val['price']." рублей</input></label>";
+                    }
+                }
+                break;
+                
+            case 'nrg':
+                if (!!$calc_val) {
+                    foreach ($calc_val as $nrg_val) {
+                        $string .= "<label><input type='radio' class='radio_tk' name='radio_tk' id='7' data-code='" . $nrg_val['city'] . "' value=" . $nrg_val['price'] . ">ТК Энергия в ".$nrg_val['city'].", стоимость доставки ".$nrg_val['price']." рублей</input></label>";
+                    }
+                }
+                break;
+                
+            case 'pec':
+                if (!!$calc_val) {
+                    foreach ($calc_val as $pec_val) {
+                        $string .= "<label><input type='radio' class='radio_tk' name='radio_tk' id='3' data-code='" . $pec_val['city'] . "' value=" . $pec_val['price'] . ">ТК ПЭК в ".$pec_val['city'].", стоимость доставки ".$pec_val['price']." рублей</input></label>";
+                    }
+                }
+                break;
+                
+            case 'cdek':
+                if (!!$calc_val) {
+                    $string .= "<label><input type='radio' class='radio_tk' name='radio_tk' id='14' data-idcode='" . $calc_val['code'] . "' data-code='" . $calc_val['city'] . "' value=" . $calc_val['price'] . ">ТК СДЭК в ".$calc_val['city'].", стоимость доставки ".$calc_val['price']." рублей</input></label>";
+                }
+                break;
+        }
+    }
+    if ($string != '') {
+        return $string;
+    }else{
+        return false;
+    }
+}
+
+/**
+ * Информация о заказе
+ */
+class adept_tk_OrderInfo extends StdClass
+{
+    // Serial id
+    public $id;
+    // ID заказа
+    public $orderId;
+    // Вес заказа
+    public $orderWeight;
+    // Вес заказа
+    public $orderAmount;
+    // Объем заказа
+    public $orderVolume;
+    // Тип упаковки
+    public $orderPack;
+    // Информация о доставке
+    public $data;
+
+    /**
+     * Конструктор информации по заказу
+     */
+    function __construct()
+    {
+    }
+
+    /**
+     * Получение данных
+     */
+    public function getOrderWeight()
+    {
+        return $this->orderWeight;
+    }
+
+    /**
+     * Получение данных
+     */
+    public function getOrderVolume()
+    {
+        return $this->orderVolume;
+    }
+
+    /**
+     * Получение данных
+     */
+    public function getOrderPack()
+    {
+        return $this->orderPack;
+    }
+
+    /**
+     * Получение данных
+     */
+    public function getOrderAmount()
+    {
+        return $this->orderAmount;
+    }
+
+    /**
+     * Получение данных
+     */
+    public function getOrderId()
+    {
+        return $this->orderId;
+    }
+
+    /**
+     * Получение данных
+     */
+    public function getData()
+    {
+        return $this->data;
+    }
+
+    /**
+     * Получение данных
+     * @param array $data
+     */
+    public function setData($data)
+    {
+        $this->data = is_array($this->data)&&is_array($data) ? array_merge($this->data, $data) : $data;
+    }
+
+    /**
+     * Заполнение данных
+     * @param int $weight вес заказа
+     * @param int $amount стоимость заказа
+     */
+    private function setInfo($weight, $amount)
+    {
+        $this->orderWeight = $weight;
+        $this->orderAmount = $amount;
+        if ($weight < '1') {
+            $this->orderVolume = '0.1';
+            $this->orderPack = '1';
+        } elseif ( $weight >= '1' && $weight <= '2') {
+            $this->orderVolume = '0.1';
+            $this->orderPack = '2';
+        } elseif ( $weight > '2' && $weight <= '3') {
+            $this->orderVolume = '0.1';
+            $this->orderPack = '3';
+        } elseif ( $weight > '3' && $weight <= '30') {
+            $this->orderVolume = '0.1';
+            $this->orderPack = '4';
+        } elseif ( $weight > '30' && $weight <= '50') {
+            $this->orderVolume = '0.2';
+            $this->orderPack = '4';
+        } elseif ( $weight > '50' && $weight <= '100') {
+            $this->orderVolume = '0.5';
+            $this->orderPack = '4';
+        }else{
+            throw new Exception("Вес товара превышает 100 кг");
+        }
+        adept_tk_save($this);
+    }
+
+    /**
+     * Инициализация информации
+     * @param orderId
+     */
+    public function initInfo($orderId)
+    {
+        $check = db_select('adept_tk', 'at')
+            ->fields('at')
+            ->condition('at.orderId', (int)$orderId)
+            ->execute()
+            ->fetchAll();
+        if (!!$check) {
+            throw new Exception("Данный заказ существует в системе");
+        }
+        $this->orderId = $orderId = (int) $orderId;
+        if($orderId == 0) {
+            throw new Exception("Неправильно задан номер заказа.");
+        }
+        $result = db_query('SELECT uop.qty, uop.weight, uop.price FROM {uc_order_products} uop WHERE uop.order_id = :ordid', array(':ordid' => $orderId));
+        $totalmass = 0;
+        $totalprice = 0;
+        foreach ($result as $produtz) {
+            $weight = $produtz->qty*$produtz->weight;
+            if ($weight > 0) {
+                $totalmass += $weight;
+            }else{
+                throw new Exception("Отсутствует вес товара");
+            }
+            $price = $produtz->qty*$produtz->price;
+            if ($price > 0) {
+                $totalprice += $price;
+            }else{
+                throw new Exception("Отсутствует стоимость товара");
+            }
+        }
+        $totalmass = ceil(($totalmass*1000+$totalmass*100)/500)/2;
+        $this->setInfo($totalmass, $totalprice);
+    }
+}
+
+function adept_tk_getCityName()
+{
+    if ($_POST['city']) {
+        $cityStr = $_POST['city'];
+        $row = db_select('og_transport_company', 'otc')
+            ->fields('otc')
+            ->condition('otc.city', db_like( $cityStr ) . '%', 'LIKE')
+            ->condition('otc.company', db_like('cdek'), 'LIKE')
+            ->execute()
+            ->fetchAll();
+        $num_of_results = count($row);
+        if ($num_of_results > 0) {
+            foreach ($row as $key) {
+                    echo "<br/><a class='city_value' href='#' id='" . $key->code . "'>" . $key->city . "</a><br/>";
+            }
+        }else{
+            header('HTTP/1.1 500 Internal Server Booboo');
+        }
+    }else{
+            header('HTTP/1.1 500 Internal Server Booboo');
+    }
+}
+
+/**
+ * Загрузка информации из БД
+ * @param orderId
+ * @return adept_tk_OrderInfo
+ */
+function adept_tk_load($orderId) 
+{
+    $row = $orderInfo = db_select('adept_tk', 'at')
+        ->fields('at')
+        ->condition('at.orderId', (int)$orderId)
+        ->execute()
+        ->fetch();
+
+    if (!$row) {
+        $first = new adept_tk_OrderInfo();
+        $first->initInfo($orderId);
+        watchdog('adept_tk', 'Данные по заказу отсутствуют. Инициализировали новые данные.');
+        $row = $orderInfo = db_select('adept_tk', 'at')
+            ->fields('at')
+            ->condition('at.orderId', (int)$orderId)
+            ->execute()
+            ->fetch();
+    }
+
+    $orderInfo = new adept_tk_OrderInfo();
+    foreach ($row as $key => $value) {
+        $orderInfo->{$key} = $value;
+    }
+
+    $orderInfo->setData(unserialize($orderInfo->data));
+
+    return $orderInfo;
+}
+
+/**
+ * Сохрание информации в БД
+ * @param adept_tk_OrderInfo $info
+ * @return bool
+ */
+function adept_tk_save($info)
+{
+    if (!!$info->data) {
+        // Load previos version
+        $prev = adept_tk_load($info->getOrderId());
+        // Merge data arrays
+        $info->data = is_array($prev->data) ? array_merge($prev->data, $info->data) : $info->data;
+    }
+
+    return !!db_merge('adept_tk')
+        ->key(array('orderId' => $info->getOrderId()))
+        ->fields(array(
+                'orderId' => $info->getOrderId(),
+                'orderWeight' => $info->getOrderWeight(),
+                'orderAmount' => $info->getOrderAmount(),
+                'orderVolume' => $info->getOrderVolume(),
+                'orderPack' => $info->getOrderPack(),
+                'data' => serialize($info->data),
+                ))
+        ->execute();
+}
+
+/**
+ * Расчёт стоимости доставки GTD
+ */
+class adept_tk_CalculatePriceDeliveryGtd
+{
+    // URL
+    private $url;
+    // ID города отправителя
+    private $cityFrom;
+    // ID города получателя
+    public $cityTo;
+    // Объем заказа
+    public $volume;
+    // Вес заказа
+    public $weight;
+    // Стоимость заказа
+    public $price;
+    // Bearer
+    private $bearer;
+    
+    function __construct()
+    {
+        $url = variable_get('adept_tk_gtd_url');
+        $cityFrom = variable_get('adept_tk_gtd_cityFrom');
+        $bearer = variable_get('adept_tk_gtd_bearer');
+    }
+
+    /**
+     * Поиск города отправителя
+     */
+    public function getCityCode($cityStr)
+    {
+        $pos = strpos($cityStr, ', ');
+        if ($pos !== false){
+            $cityStr = stristr($cityStr, ', ', true);
+        }
+        $resultCityCode = db_select('og_transport_company', 'otc')
+            ->fields('otc')
+            ->condition('otc.city', db_like( $cityStr ) . '%', 'LIKE')
+            ->condition('otc.company', db_like('gtd'), 'LIKE')
+            ->execute()
+            ->fetchAll();
+        $num_of_results = count($resultCityCode);
+        if ($num_of_results > 0) {
+            $arr = array();
+            foreach ($resultCityCode as $key) {
+                    $arr[] = array ( 'code' => $key->code, 'city' => $key->city );
+            }
+            $this->setCityTo($arr);
+        }else{
+            $this->setCityTo(false);
+        }
+    }
+
+    /**
+     * Установка города отправителя
+     */
+    public function setCityFrom($cityFrom)
+    {
+        $this->cityFrom = $cityFrom;
+    }
+
+    /**
+     * Установка города отправителя
+     */
+    public function getCityTo()
+    {
+        return $this->cityTo;
+    }
+
+    /**
+     * Установка города получателя
+     */
+    public function setCityTo($cityTo)
+    {
+        $this->cityTo = $cityTo;
+    }
+
+    /**
+     * Установка объема
+     */
+    public function setVolume($volume)
+    {
+        $this->volume = $volume;
+    }
+
+    /**
+     * Установка веса
+     */
+    public function setWeight($weight)
+    {
+        $this->weight = $weight;
+    }
+
+    /**
+     * Установка цены
+     */
+    public function setPrice($price)
+    {
+        $this->price = $price;
+    }
+
+    /**
+     * Запрос данных
+     */
+    private function getData($data)
+    {
+        $ch = curl_init();
+        $payload = json_encode( $data );
+        curl_setopt($ch, CURLOPT_POSTFIELDS, $payload);
+        curl_setopt($ch, CURLOPT_URL, $this->url);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, array(
+                'Authorization: Bearer '.$this->bearer,
+                'Content-Type:application/json'
+        ));
+        $out = curl_exec($ch);
+        curl_close($ch);
+        $answ = json_decode($out, true);
+        if (!isset($answ['0']['standart']['detail']['2'])) {
+                return ceil(($answ['0']['standart']['cost'] + $answ['0']['standart']['cost']/10)/100)*100;
+        }
+    }
+
+    /**
+     * Сборка и расчёт
+     */
+    public function calculate()
+    {
+        $answ = array();
+        if (is_bool($this->cityTo)) {
+            return false;
+        }
+        foreach ($this->cityTo as $cityTo) {
+                $arr = [
+                    "city_pickup_code" => isset($this->cityFrom) ? $this->cityFrom : '',
+                    "city_delivery_code" => isset($cityTo['code']) ? $cityTo['code'] : '',
+                    "declared_price" => isset($this->price) ? $this->price : '',
+                    "places" => [
+                        0 => [
+                                    "count_place" => "1",
+                                    "volume" => isset($this->volume) ? $this->volume : '',
+                                    "weight" => isset($this->weight) ? ceil($this->weight) : '',
+                            ],
+                    ],
+                ];
+                if (!!$this->getData($arr)) {
+                        $answ[] = array( 'price' => $this->getData($arr), 'city' => $cityTo['city'] );
+                }else{
+                    return false;
+                }
+        }
+        return $answ;
+    }
+}
+
+/**
+ * Расчёт стоимости доставки Деловые линии
+ */
+class adept_tk_CalculatePriceDeliveryDellin
+{
+    // URL
+    private $url;
+    // ID города отправителя
+    private $cityFrom;
+    // ID города получателя
+    public $cityTo;
+    // Объем заказа
+    public $volume;
+    // Вес заказа
+    public $weight;
+    // App-Key
+    private $appkey;
+    
+    function __construct()
+    {
+        $this->url = variable_get('adept_tk_dellin_url');
+        $this->cityFrom = variable_get('adept_tk_dellin_cityFrom');
+        $this->appkey = variable_get('adept_tk_dellin_appkey');
+    }
+
+    /**
+     * Установка города отправителя
+     */
+    public function setCityFrom($cityFrom)
+    {
+        $this->cityFrom = $cityFrom;
+    }
+
+    /**
+     * Поиск города отправителя
+     */
+    public function getCityCode($cityStr)
+    {
+        $pos = strpos($cityStr, ', ');
+        if ($pos !== false){
+            $cityStr = stristr($cityStr, ', ', true);
+        }
+        $resultCityCode = db_select('og_transport_company', 'otc')
+            ->fields('otc')
+            ->condition('otc.city', db_like( $cityStr ) . '%', 'LIKE')
+            ->condition('otc.company', db_like('dellin'), 'LIKE')
+            ->execute()
+            ->fetchAll();
+        $num_of_results = count($resultCityCode);
+        if ($num_of_results > 0) {
+            $arr = array();
+            foreach ($resultCityCode as $key) {
+                    $arr[] = array ( 'code' => $key->code, 'city' => $key->city );
+            }
+            $this->setCityTo($arr);
+        }else{
+            $this->setCityTo(false);
+        }
+    }
+
+    /**
+     * Установка города получателя
+     */
+    public function setCityTo($cityTo)
+    {
+        $this->cityTo = $cityTo;
+    }
+
+    /**
+     * Установка объема
+     */
+    public function setVolume($volume)
+    {
+        $this->volume = $volume;
+    }
+
+    /**
+     * Установка веса
+     */
+    public function setWeight($weight)
+    {
+        $this->weight = $weight;
+    }
+
+    /**
+     * Запрос данных
+     */
+    private function getData($data)
+    {
+        $ch = curl_init();
+        $payload = json_encode( $data );
+        curl_setopt($ch, CURLOPT_POSTFIELDS, $payload);
+        curl_setopt($ch, CURLOPT_URL, $this->url);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, array(
+            'Content-Type:application/json'
+        ));
+        $out = curl_exec($ch);
+        curl_close($ch);
+        $answ = json_decode($out, true);
+        if (isset($answ['price'])) {
+                return ceil(($answ['price'] + $answ['price']/10)/100)*100;
+        }
+    }
+
+    /**
+     * Сборка и расчёт
+     */
+    public function calculate()
+    {
+        if (is_bool($this->cityTo)) {
+            return false;
+        }
+        $answ = array();
+        foreach ($this->cityTo as $cityTo) {
+                $arr = [
+                    "appkey" => $this->appkey,
+                    "derivalPoint" => isset($this->cityFrom) ? $this->cityFrom : '',
+                    "arrivalPoint" => isset($cityTo['code']) ? $cityTo['code'] : '',
+                    "sizedVolume" => isset($this->volume) ? $this->volume : '',
+                    "sizedWeight" => isset($this->weight) ? ceil($this->weight) : '',
+                ];
+                if (!!$this->getData($arr)) {
+                        $answ[] = array( 'price' => $this->getData($arr), 'city' => $cityTo['city'] );
+                }else{
+                    return false;
+                }
+        }
+        return $answ;
+    }
+}
+
+/**
+ * Расчёт стоимости доставки Энергия
+ */
+class adept_tk_CalculatePriceDeliveryNrg
+{
+    // URL
+    private $url;
+    // ID города отправителя
+    private $cityFrom;
+    // ID города получателя
+    public $cityTo;
+    // Объем заказа
+    public $volume;
+    // Width
+    public $width;
+    // Height
+    public $height;
+    // Length
+    public $length;
+    // Вес заказа
+    public $weight;
+    // Token
+    private $token;
+    // Стоимость заказа
+    public $price;
+    
+    function __construct()
+    {
+        $this->url = variable_get('adept_tk_nrg_url');
+        $this->cityFrom = variable_get('adept_tk_nrg_cityFrom');
+        $this->token = variable_get('adept_tk_nrg_token');
+    }
+
+    /**
+     * Поиск города отправителя
+     */
+    public function getCityCode($cityStr)
+    {
+        $pos = strpos($cityStr, ', ');
+        if ($pos !== false){
+            $cityStr = stristr($cityStr, ', ', true);
+        }
+        $resultCityCode = db_select('og_transport_company', 'otc')
+            ->fields('otc')
+            ->condition('otc.city', db_like( $cityStr ) . '%', 'LIKE')
+            ->condition('otc.company', db_like('nrg'), 'LIKE')
+            ->execute()
+            ->fetchAll();
+        $arr = array();
+        $num_of_results = count($resultCityCode);
+        if ($num_of_results > 0) {
+            $arr = array();
+            foreach ($resultCityCode as $key) {
+                    $arr[] = array ( 'code' => $key->code, 'city' => $key->city );
+            }
+            $this->setCityTo($arr);
+        }else{
+            $this->setCityTo(false);
+        }
+    }
+
+    /**
+     * Установка города отправителя
+     */
+    public function setCityFrom($cityFrom)
+    {
+        $this->cityFrom = $cityFrom;
+    }
+
+    /**
+     * Установка города получателя
+     */
+    public function setCityTo($cityTo)
+    {
+        $this->cityTo = $cityTo;
+    }
+
+    /**
+     * Установка объема
+     */
+    public function setVolume($volume)
+    {
+        $this->volume = $volume;
+    }
+
+    /**
+     * Установка веса
+     */
+    public function setWeight($weight)
+    {
+        $this->weight = $weight;
+    }
+
+    /**
+     * Установка цены
+     */
+    public function setPrice($price)
+    {
+        $this->price = $price;
+    }
+
+    /**
+     * Запрос данных
+     */
+    private function getData($data)
+    {
+        $ch = curl_init();
+        $payload = json_encode( $data );
+        curl_setopt($ch, CURLOPT_POSTFIELDS, $payload);
+        curl_setopt($ch, CURLOPT_URL, $this->url);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, array(
+            'NrgApi-DevToken: '.$this->token,
+            'Content-Type:application/json',
+        ));
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        $out = curl_exec($ch);
+        curl_close($ch);
+        $answ = json_decode($out, true);
+        if (isset($answ['transfer']['0']['price'])) {
+                return ceil(($answ['transfer']['0']['price'] + $answ['transfer']['0']['price']/10)/100)*100;
+        }
+    }
+
+    /**
+     * Сборка и расчёт
+     */
+    public function calculate()
+    {
+        if (is_bool($this->cityTo)) {
+            return false;
+        }
+        $answ = array();
+        foreach ($this->cityTo as $cityTo) {
+                $arr = [
+                    "idCityFrom" => isset($this->cityFrom) ? (int)$this->cityFrom : '',
+                    "idCityTo" => isset($cityTo['code']) ? (int)$cityTo['code'] : '',
+                    "cover" => 0,
+                    "declaredCargoPrice" => isset($this->price) ? (int)$this->price : '',
+                    "items" => [
+                        0 => [
+                                "weight" => isset($this->weight) ? floatval($this->weight) : '',
+                                "width"  => isset($this->width) ? floatval($this->width) : 0.27,
+                                "height"  => isset($this->height) ? floatval($this->height) : 0.27,
+                                "length"  => isset($this->length) ? floatval($this->length) : 0.27,
+                            ],
+                    ],
+                ];
+                if (!!$this->getData($arr)) {
+                        $answ[] = array( 'price' => $this->getData($arr), 'city' => $cityTo['city'] );
+                }
+        }
+        return $answ;
+    }
+}
+
+
+/**
+ * Расчёт стоимости доставки ПЭК
+ */
+class adept_tk_CalculatePriceDeliveryPec
+{
+    // URL
+    private $url;
+    // ID города отправителя
+    public $cityFrom;
+    // ID города получателя
+    public $cityTo;
+    // Объем заказа
+    public $volume;
+    // Вес заказа
+    public $weight;
+
+    public function __construct() 
+    {
+        $this->url = variable_get('adept_tk_pec_url');
+        $this->cityFrom = variable_get('adept_tk_pec_cityFrom');
+    }
+
+    /**
+     * Поиск города отправителя
+     */
+    public function getCityCode($cityStr)
+    {
+        $pos = strpos($cityStr, ', ');
+        if ($pos !== false){
+            $cityStr = stristr($cityStr, ', ', true);
+        }
+        $resultCityCode = db_select('og_transport_company', 'otc')
+            ->fields('otc')
+            ->condition('otc.city', db_like( $cityStr ) , 'LIKE')
+            ->condition('otc.company', db_like('pec'), 'LIKE')
+            ->execute()
+            ->fetchAll();
+        $num_of_results = count($resultCityCode);
+        if ($num_of_results > 0) {
+            $arr = array();
+            foreach ($resultCityCode as $key) {
+                    $arr[] = array ( 'code' => $key->code, 'city' => $key->city );
+            }
+            $this->setCityTo($arr);
+        }else{
+            $this->setCityTo(false);
+        }
+    }
+
+    /**
+     * Установка города отправителя
+     */
+    public function setCityFrom($cityFrom)
+    {
+        $this->cityFrom = $cityFrom;
+    }
+
+    /**
+     * Установка города получателя
+     */
+    public function setCityTo($cityTo)
+    {
+        $this->cityTo = $cityTo;
+    }
+
+    /**
+     * Установка объема
+     */
+    public function setVolume($volume)
+    {
+        $this->volume = $volume;
+    }
+
+    /**
+     * Установка веса
+     */
+    public function setWeight($weight)
+    {
+        $this->weight = $weight;
+    }
+
+    /**
+     * Запрос данных
+     */
+    private function getData($data)
+    {
+        $ch = curl_init();
+        $params = http_build_query($data);
+        curl_setopt_array($ch, array(
+            CURLOPT_URL => $this->url.'?'.$params,
+            CURLOPT_RETURNTRANSFER => true
+        ));
+
+        $out = curl_exec($ch);
+        curl_close($ch);
+        $answ = json_decode($out, true);
+        if ($answ['auto']['2'] && stristr($answ['deliver']['1'], ' - ', TRUE) === FALSE) {
+                return ceil(($answ['auto']['2'] + $answ['auto']['2']/10)/100)*100;
+        }
+    }
+
+    /**
+     * Сборка и расчёт
+     */
+    public function calculate()
+    {
+        if (is_bool($this->cityTo)) {
+            return false;
+        }
+        $answ = array();
+        foreach ($this->cityTo as $cityTo) {
+            $arr = [
+                'places' => [
+                    [
+                        0, // Ширина
+                        0, // Длина
+                        0, // Высота
+                        isset($this->volume) ? $this->volume : '', // Объем
+                        isset($this->weight) ? $this->weight : '', // Вес
+                        0, // Признак негабаритности груза
+                        0 // Признак ЖУ
+                    ]
+                ],
+                'take' => [
+                    'town' => isset($this->cityFrom) ? $this->cityFrom : '',
+                ],
+                'deliver' => [
+                    'town' => isset($cityTo['code']) ? $cityTo['code'] : '',
+                ],
+                'plombir' => 1,
+            ];
+            if (!!$this->getData($arr)) {
+                    $answ[] = array( 'price' => $this->getData($arr), 'city' => $cityTo['city'] );
+            }
+        }
+        return $answ;
+    }
+}
+
+
+/**
+ * Расчёт стоимости доставки СДЭК
+ * Модуль для интернет-магазинов (ИМ)
+ * 
+ * @version 1.0
+ * @since 21.06.2012
+ * @link http://www.edostavka.ru/integrator/
+ * @see 3197
+ * @author Tatyana Shurmeleva
+ */
+class adept_tk_CalculatePriceDeliveryCdek 
+{
+    
+    //версия модуля
+    private $version = "1.0";
+    //url для получения данных по отправке
+    private $jsonUrl;
+        
+    //авторизация ИМ
+    private $authLogin;
+    private $authPassword;
+    
+    //id города-отправителя
+    private $senderCityId;
+    //id города-получателя
+    private $receiverCityId;
+    //id тарифа
+    private $tariffId;
+    //id способа доставки (склад-склад, склад-дверь)
+    private $modeId;
+    //массив мест отправления
+    public $goodsList;
+    //массив id тарифов
+    public $tariffList;
+    //результат расчёта стоимости отправления ИМ
+    private $result;
+    //результат в случае ошибочного расчёта
+    private $error;
+    //планируемая дата заказа
+    public $dateExecute;
+    
+    /**
+     * конструктор
+     */
+    public function __construct() {
+        $this->dateExecute = date('Y-m-d');
+        $this->jsonUrl = variable_get('adept_tk_cdek_url');
+        $this->authLogin = variable_get('adept_tk_cdek_authLogin');
+        $this->authPassword = variable_get('adept_tk_cdek_authPass');
+        $this->senderCityId = variable_get('adept_tk_cdek_cityFrom');
+        $this->tariffId = variable_get('adept_tk_cdek_tariff');
+    } 
+    
+    /**
+     * Установка планируемой даты отправки
+     * 
+     * @param string $date дата планируемой отправки, например '2012-06-25'
+     */
+    public function setDateExecute($date) {
+        $this->dateExecute = date($date);
+    }
+    
+    /**
+     * Авторизация ИМ
+     * 
+     * @param string $authLogin логин
+     * @param string $authPassword пароль
+     */
+    public function setAuth($authLogin, $authPassword) {
+        $this->authLogin = $authLogin;
+        $this->authPassword = $authPassword;
+    }
+
+    /**
+     * Защифрованный пароль для передачи на сервер
+     * 
+     * @return string
+     */
+    private function _getSecureAuthPassword() {
+        return md5($this->dateExecute . '&' . $this->authPassword);
+    }
+
+    /**
+     * Город-отправитель
+     * 
+     * @param int $id города
+     */
+    public function setSenderCityId($id) {
+        $id = (int) $id;
+        if($id == 0) {
+            throw new Exception("Неправильно задан город-отправитель.");
+        }
+        $this->senderCityId = $id;
+    } 
+    
+    /**
+     * Город-получатель
+     * 
+     * @param int $id города
+     */
+    public function setReceiverCityId($id) {
+        $id = (int) $id;
+        if($id == 0) {
+            throw new Exception("Неправильно задан город-получатель.");
+        }   
+        $this->receiverCityId = $id;
+    } 
+
+    /**
+     * Устанавливаем тариф
+     * 
+     * @param int $id тарифа
+     */
+    public function setTariffId($id) {
+        $id = (int) $id;
+        if($id == 0) {
+            throw new Exception("Неправильно задан тариф.");
+        }   
+        $this->tariffId = $id;
+    }
+    
+    /**
+     * Устанавливаем режим доставки (дверь-дверь=1, дверь-склад=2, склад-дверь=3, склад-склад=4)
+     * 
+     * @param int $id режим доставки
+     */
+    public function setModeDeliveryId($id) {
+        $id = (int) $id;
+        if(!in_array($id, array(1,2,3,4))) {
+            throw new Exception("Неправильно задан режим доставки.");
+        }
+        $this->modeId = $id;
+    }
+    
+    /**
+     * Добавление места в отправлении 
+     * 
+     * @param int $weight вес, килограммы
+     * @param int $length длина, сантиметры
+     * @param int $width ширина, сантиметры
+     * @param int $height высота, сантиметры
+     */
+    public function addGoodsItemBySize($weight, $length, $width, $height) {
+        //проверка веса
+        $weight = (float) $weight;
+        if($weight == 0.00) {
+            throw new Exception("Неправильно задан вес места № " . (count($this->getGoodslist())+1) . ".");
+        }
+        //проверка остальных величин
+        $paramsItem = array("длина"   => $length, 
+                            "ширина"  => $width, 
+                            "высота"  => $height);
+        foreach($paramsItem as $k=>$param) {
+            $param = (int) $param;
+            if($param==0) {
+                throw new Exception("Неправильно задан параметр '" . $k . "' места № " . (count($this->getGoodslist())+1) . ".");
+            }
+        }
+        $this->goodsList[] = array( 'weight'  => $weight, 
+                                    'length'  => $length,
+                                    'width'   => $width,
+                                    'height'  => $height);
+    }
+
+    /**
+     * Добавление места в отправлении по объёму (куб.метры)
+     * 
+     * @param int $weight вес, килограммы
+     * @param int $volume объёмный вес, метры кубические (А * В * С)
+     */
+    public function addGoodsItemByVolume($weight, $volume) {
+        $paramsItem = array("вес"       => $weight, 
+                            "объёмный вес"  => $volume);
+        foreach($paramsItem as $k=>$param) {
+            $param = (float) $param;
+            if($param == 0.00) {
+                throw new Exception("Неправильно задан параметр '" . $k . "' места № " . (count($this->getGoodslist())+1) . ".");
+            }
+        }
+        $this->goodsList[] = array( 'weight'  => $weight, 
+                                    'volume'  => $volume );
+    }
+    
+    /**
+     * Получение массива мест отправления
+     * 
+     * @return array
+     */
+    public function getGoodslist() {
+        if(!isset($this->goodsList)) {
+            return NULL;
+        }
+        return $this->goodsList;
+    }
+    
+    /**
+     * добавление тарифа в список тарифов с приоритетами
+     * 
+     * @param int $id тариф
+     * @param int $priority default false приоритет
+     */
+    public function addTariffPriority($id, $priority = 0) {
+        $id = (int) $id;
+        if($id == 0) {
+            throw new Exception("Неправильно задан id тарифа.");
+        }
+                $priority = ($priority > 0) ? $priority : count($this->tariffList)+1;
+        $this->tariffList[] = array( 'priority' => $priority,
+                                     'id'     => $id);
+    }
+    
+    /**
+     * Получение массива заданных тарифов
+     * 
+     * @return array
+     */
+    private function _getTariffList() {
+        if(!isset($this->tariffList)) {
+            return NULL;
+        }
+        return $this->tariffList;
+    }
+
+    /**
+     * Выполнение POST-запроса на сервер для получения данных
+     * по запрашиваемым параметрам.
+     * 
+     * 
+     */
+    private function _getRemoteData($data) {
+        $data_string = json_encode($data);                                                                                   
+        
+        $ch = curl_init();
+        curl_setopt($ch, CURLOPT_URL, $this->jsonUrl);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, array(
+            'Content-Type: application/json') 
+            );
+        curl_setopt($ch, CURLOPT_POST, 1);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, $data_string);
+        
+        $result = curl_exec($ch); 
+        curl_close($ch); 
+        
+        return json_decode($result, true);
+    }
+    
+    /**
+     * Расчет стоимости доставки
+     * 
+     * @return bool
+     */
+    public function calculate() {
+        //формируем массив для отправки curl-post-запроса
+        //передаём только явно заданные параметры, установленные ИМ
+        //всю проверку и обработку будем делать на стороне сервера
+        $data = array();
+        //получение всех свойств текущего объекта не работает, т.к. у нас свойства private
+        //поэтому определим массив $data явно
+        //проверяем на установленную переменную и не-NULL-значение
+        
+        //версия модуля
+        isset($this->version) ? $data['version'] = $this->version : '';
+        //дата планируемой доставки, если не установлено, берётся сегодняшний день
+        $data['dateExecute'] = $this->dateExecute;
+        //авторизация: логин
+        isset($this->authLogin) ? $data['authLogin'] = $this->authLogin : '';
+        //авторизация: пароль
+        isset($this->authPassword) ? $data['secure'] = $this->_getSecureAuthPassword() : '';
+        //город-отправитель
+        isset($this->senderCityId) ? $data['senderCityId'] = $this->senderCityId : '';
+        //город-получатель
+        isset($this->receiverCityId) ? $data['receiverCityId'] = $this->receiverCityId : '';
+        //выбранный тариф
+        isset($this->tariffId) ? $data['tariffId'] = $this->tariffId : '';
+        //список тарифов с приоритетами
+        ( isset($this->tariffList)  ) ? $data['tariffList'] = $this->tariffList : '';
+        //режим доставки
+        isset($this->modeId) ? $data['modeId'] = $this->modeId : '';
+        
+        //список мест
+        if( isset($this->goodsList) ) {
+            foreach ($this->goodsList as $idGoods => $goods) {
+                $data['goods'][$idGoods] = array();
+                //вес
+                (isset($goods['weight']) && $goods['weight'] <> '' && $goods['weight'] > 0.00) ? $data['goods'][$idGoods]['weight'] = $goods['weight'] : '';
+                //длина
+                (isset($goods['length']) && $goods['length'] <> '' && $goods['length'] > 0) ? $data['goods'][$idGoods]['length'] = $goods['length'] : '';
+                //ширина
+                (isset($goods['width']) && $goods['width'] <> '' && $goods['width'] > 0) ? $data['goods'][$idGoods]['width'] = $goods['width'] : '';
+                //высота
+                (isset($goods['height']) && $goods['height'] <> '' && $goods['height'] > 0) ? $data['goods'][$idGoods]['height'] = $goods['height'] : '';
+                //объемный вес (куб.м)
+                (isset($goods['volume']) && $goods['volume'] <> '' && $goods['volume'] > 0.00) ? $data['goods'][$idGoods]['volume'] = $goods['volume'] : '';
+
+            }
+        }
+        //проверка на подключние библиотеки curl
+        if(!extension_loaded('curl')) {
+            throw new Exception("Не подключена библиотека CURL");
+        }   
+        $response = $this->_getRemoteData($data);
+                
+                if( isset($response['result']) && !empty($response['result']) ) {
+                        $this->result = $response;
+                        return true;
+                } else {
+                        $this->error = $response;
+                        return false;
+                }
+        //return (isset($response['result']) && (!empty($response['result']))) ? true : false;
+        //результат
+        //$result = ($this->getResponse());
+        //return $result;
+    }
+    
+    /**
+     * Получить результаты подсчета
+     * 
+     * @return array
+     */
+    public function getResult() {
+        return $this->result;
+    }
+    
+    /**
+     * получить код и текст ошибки
+     * 
+     * @return object
+     */
+    public function getError() {
+        return $this->error;
+    }
+}
+

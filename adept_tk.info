@@ -1,0 +1,5 @@
+name = Adept delivery calculator
+description = Расчёт стоимости доставки для интернет-магазина
+package = Adept.TK
+core = 7.x
+configure = admin/config/system/adept_tk

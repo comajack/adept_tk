@@ -1,0 +1,63 @@
+<?php 
+
+/**
+ * Implements hook_schema().
+ */
+
+function adept_tk_schema() {
+  $schema['adept_tk'] = array(
+  'description' => 'Adept table.',
+    'fields' => array(
+      'id' => array(
+        'type' => 'serial',
+        'not null' => TRUE,
+        'description' => "The action id.",
+      ),
+      'orderId' => array(
+        'type' => 'int',
+        'not null' => TRUE,
+        'default' => 0,
+        'description' => 'Order ID.',
+      ),
+      'orderWeight' => array(
+        'type' => 'numeric',
+        'precision' => 16,
+        'scale' => 2,
+        'not null' => TRUE,
+        'default' => 0.0,
+        'description' => 'Order weight.',
+      ),
+      'orderVolume' => array(
+        'type' => 'numeric',
+        'precision' => 16,
+        'scale' => 2,
+        'not null' => TRUE,
+        'default' => 0.0,
+        'description' => 'Order volume.',
+      ),
+      'orderPack' => array(
+        'type' => 'int',
+        'not null' => TRUE,
+        'default' => 0,
+        'description' => 'Order pack.',
+      ),
+      'orderAmount' => array(
+        'type' => 'numeric',
+        'precision' => 16,
+        'scale' => 2,
+        'not null' => TRUE,
+        'default' => 0.0,
+        'description' => 'Order total.',
+      ),
+      'data' => array(
+        'type' => 'text',
+        'serialize' => TRUE,
+      ),
+    ),
+    'primary key' => array('id'),
+    'indexes' => array(
+      'orderId' => array('orderId'),
+    ),
+  );
+  return $schema;
+}
